@@ -1,57 +1,73 @@
 import logging
-from django.utils import timezone
 from django.utils.deprecation import MiddlewareMixin
-from .models import RequestLog
+from django.utils import timezone
+from django.http import HttpResponseForbidden
+from .models import RequestLog, BlockedIP
 
-logger = logging.getLogger(__name__)
 
 class IPTrackingMiddleware(MiddlewareMixin):
     """
     Middleware to log IP address, timestamp, and path of every incoming request.
+    Also blocks requests from blacklisted IPs.
     """
+    
+    def __init__(self, get_response=None):
+        super().__init__(get_response)
+        self.logger = logging.getLogger(__name__)
     
     def process_request(self, request):
         """
-        Process incoming request and log details to database.
+        Process incoming request, check if IP is blocked, and log the details.
         """
-        # Get client IP address (handles proxy/load balancer scenarios)
+        # Get the real IP address (handles proxies and load balancers)
         ip_address = self.get_client_ip(request)
         
-        # Get request path
+        # Check if IP is blocked
+        if BlockedIP.is_blocked(ip_address):
+            self.logger.warning(
+                f"Blocked request from IP: {ip_address}, Path: {request.get_full_path()}"
+            )
+            return HttpResponseForbidden(
+                "<h1>403 Forbidden</h1><p>Your IP address has been blocked.</p>",
+                content_type="text/html"
+            )
+        
+        # Get the request path
         path = request.get_full_path()
         
         # Get current timestamp
         timestamp = timezone.now()
         
         try:
-            # Create log entry in database
+            # Save to database
             RequestLog.objects.create(
                 ip_address=ip_address,
                 timestamp=timestamp,
                 path=path
             )
             
-            # Also log to Django's logging system
-            logger.info(f"Request logged: IP={ip_address}, Path={path}, Time={timestamp}")
+            # Also log to console/file
+            self.logger.info(
+                f"Request logged - IP: {ip_address}, Path: {path}, Time: {timestamp}"
+            )
             
         except Exception as e:
-            # Log error but don't break the request processing
-            logger.error(f"Failed to log request: {str(e)}")
+            # Log error but don't break the request flow
+            self.logger.error(f"Failed to log request: {str(e)}")
         
-        # Return None to continue processing the request
+        # Continue processing the request
         return None
     
     def get_client_ip(self, request):
         """
-        Get the client's IP address, handling proxies and load balancers.
+        Get the real client IP address from the request.
+        Handles cases where the request goes through proxies or load balancers.
         """
-        # Check for IP in X-Forwarded-For header (common with proxies/load balancers)
         x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
         if x_forwarded_for:
-            # X-Forwarded-For can contain multiple IPs, take the first one
+            # Take the first IP in the chain (the original client)
             ip = x_forwarded_for.split(',')[0].strip()
         else:
-            # Fall back to REMOTE_ADDR
             ip = request.META.get('REMOTE_ADDR')
         
-        return ip or 'unknown'
+        return ip or '0.0.0.0'  # Fallback if no IP found
